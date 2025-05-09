@@ -211,7 +211,7 @@ def fetch_news_from_duckduckgo(query="popular news headlines", num_results=3):
                     is_relevant = any(keyword in title.lower() for keyword in tech_keywords) or \
                                   any(keyword in url.lower() for keyword in tech_keywords)
                     
-                    if query.lower().count(" ") < 3 or is_relevant:
+                    if query.lower().count(" ") < 3 or is_relevant: # If query is very generic, be stricter with tech keywords
                         news_items.append({'title': title, 'url': url})
                         if len(news_items) >= num_results:
                             break
@@ -298,12 +298,12 @@ def get_sufficient_article_content(initial_article_data, posted_urls_set, min_po
     effective_keywords = initial_article_data.get('ai_keywords', initial_article_data.get('keywords', []))
     if effective_keywords: search_terms.extend([kw for kw in effective_keywords[:2] if kw.strip()])
     search_terms.append(initial_article_data['title']) 
-    related_search_query = " ".join(dict.fromkeys(search_terms)) + " latest technology"
+    related_search_query = " ".join(dict.fromkeys(search_terms)) + " latest technology" # Make unique
 
     num_additional_needed = max_articles_to_combine - len(all_articles_data)
     if num_additional_needed <= 0: return all_articles_data
 
-    num_to_fetch_candidates = min(num_additional_needed * 2, 5) 
+    num_to_fetch_candidates = min(num_additional_needed * 2, 5) # Fetch more candidates than strictly needed
     add_log(f"Searching for up to {num_to_fetch_candidates} related articles with query: \"{related_search_query}\"")
     additional_potential_sites = fetch_news_from_duckduckgo(query=related_search_query, num_results=num_to_fetch_candidates)
     
@@ -368,8 +368,6 @@ def fetch_related_youtube_video(query):
         return None
 
 def format_blog_post_content(list_of_article_data, video_data=None):
-    # (Content of this function is identical to original, assuming it's fine)
-    # No add_log calls typically needed here as it's formatting.
     if not list_of_article_data: return ""
 
     primary_article = list_of_article_data[0]
@@ -478,8 +476,14 @@ def get_credentials(client_id, client_secret):
     if os.path.exists(TOKEN_FILE):
         try:
             creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            add_log(f"Loaded credentials from {TOKEN_FILE}")
         except Exception as e:
-            add_log(f"Error loading token from file: {e}. Will try to re-authenticate.")
+            add_log(f"Error loading token from file {TOKEN_FILE}: {e}. Will try to re-authenticate.")
+            if os.path.exists(TOKEN_FILE):
+                try: 
+                    os.remove(TOKEN_FILE)
+                    add_log(f"Removed potentially corrupt token file: {TOKEN_FILE}")
+                except OSError as ose: add_log(f"Could not remove token file {TOKEN_FILE}: {ose}")
             creds = None
     
     if not creds or not creds.valid:
@@ -489,40 +493,37 @@ def get_credentials(client_id, client_secret):
                 creds.refresh(Request())
                 with open(TOKEN_FILE, 'w') as token_f:
                     token_f.write(creds.to_json())
-                add_log("Credentials refreshed successfully.")
+                add_log("Credentials refreshed successfully and saved.")
                 return creds
-            except Exception as e:
+            except Exception as e: # Covers google.auth.exceptions.RefreshError for "invalid_grant" etc.
                 add_log(f"Failed to refresh credentials: {e}. Need to re-authenticate.")
-                if os.path.exists(TOKEN_FILE): # Remove potentially corrupt token file
-                    try: os.remove(TOKEN_FILE)
-                    except: pass
+                if os.path.exists(TOKEN_FILE): 
+                    try: 
+                        os.remove(TOKEN_FILE)
+                        add_log(f"Removed token file due to refresh failure: {TOKEN_FILE}")
+                    except OSError as ose: add_log(f"Could not remove token file {TOKEN_FILE}: {ose}")
                 creds = None # Force re-authentication
         
         if not creds: # Needs full authentication
-            add_log("No valid credentials, starting authentication flow...")
-            # Construct client_config for InstalledAppFlow
+            add_log("No valid credentials, starting OAuth authentication flow...")
             client_config_dict = {
                 "installed": {
                     "client_id": client_id,
                     "client_secret": client_secret,
                     "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                     "token_uri": "https://oauth2.googleapis.com/token",
-                    "redirect_uris": ["http://localhost", "urn:ietf:wg:oauth:2.0:oob"]
+                    "redirect_uris": ["http://localhost", "urn:ietf:wg:oauth:2.0:oob"] # urn for console, http://localhost for local server
                 }
             }
             try:
                 flow = InstalledAppFlow.from_client_config(client_config_dict, SCOPES)
-                # run_local_server is generally preferred for better UX if browser access is available
-                # It opens a browser and listens on a local port.
-                # port=0 lets it pick an available port.
-                add_log("Attempting to launch browser for authentication (InstalledAppFlow)...")
-                creds = flow.run_local_server(port=0) 
-                # If run_local_server fails (e.g. no GUI browser), run_console() can be a fallback
-                # but requires manual copy-pasting of URL and code.
+                add_log("Attempting to launch browser for authentication (InstalledAppFlow using run_local_server)...")
+                # Try run_local_server first
+                creds = flow.run_local_server(port=0, prompt='consent', authorization_prompt_message='Please authorize access to Blogger.')
             except Exception as e_local_server:
                 add_log(f"run_local_server failed: {e_local_server}. Trying run_console as fallback.")
                 try:
-                    flow = InstalledAppFlow.from_client_config(client_config_dict, SCOPES)
+                    flow = InstalledAppFlow.from_client_config(client_config_dict, SCOPES) # Re-initialize flow
                     creds = flow.run_console()
                 except Exception as e_console:
                     add_log(f"run_console authentication flow also failed: {e_console}")
@@ -531,7 +532,7 @@ def get_credentials(client_id, client_secret):
             if creds:
                 with open(TOKEN_FILE, 'w') as token_f:
                     token_f.write(creds.to_json())
-                add_log("Authentication successful. Credentials saved.")
+                add_log("Authentication successful. Credentials saved to token.json.")
             else:
                 add_log("Authentication flow did not return credentials.")
     
@@ -554,24 +555,30 @@ def get_blogger_service_instance(credentials):
         return None
 
 def post_to_blogger_oauth(credentials_obj, current_blog_id_val, article_title, content_html, labels_list):
-    if not credentials_obj:
-        add_log("ERROR: Blogger credentials not available for posting.")
+    if not credentials_obj or not credentials_obj.valid: # Added check for creds.valid
+        add_log("ERROR: Blogger credentials not available or invalid for posting.")
+        # Potentially trigger re-auth by clearing session state if not already handled
+        if 'credentials' in st.session_state and st.session_state.credentials == credentials_obj:
+            st.session_state.credentials = None
+            if os.path.exists(TOKEN_FILE):
+                try: os.remove(TOKEN_FILE); add_log("Removed token file due to invalid creds before posting.")
+                except Exception as ex_del: add_log(f"Could not delete token file: {ex_del}")
         return None
 
     service = get_blogger_service_instance(credentials_obj)
     if not service:
         add_log("Failed to initialize Blogger service. Cannot post.")
-        # Potentially signal for re-authentication if this happens often
-        st.session_state.credentials = None # Invalidate creds to force re-auth
-        if os.path.exists(TOKEN_FILE): 
-            try: os.remove(TOKEN_FILE)
-            except: pass
+        if 'credentials' in st.session_state and st.session_state.credentials == credentials_obj:
+            st.session_state.credentials = None 
+            if os.path.exists(TOKEN_FILE): 
+                try: os.remove(TOKEN_FILE); add_log("Removed token file due to service init failure.")
+                except Exception as ex_del: add_log(f"Could not delete token file: {ex_del}")
         return None
 
     final_labels = ['Tech News', 'AI Update', 'Gadget Review', 'Automated Post']
     for lbl in labels_list:
         cleaned_lbl = lbl.strip()
-        if cleaned_lbl and cleaned_lbl not in final_labels and len(final_labels) < 20:
+        if cleaned_lbl and cleaned_lbl not in final_labels and len(final_labels) < 20: # Blogger label limit
             final_labels.append(cleaned_lbl)
     
     post_body = {'kind': 'blogger#post', 'title': article_title, 'content': content_html, 'labels': final_labels}
@@ -581,32 +588,40 @@ def post_to_blogger_oauth(credentials_obj, current_blog_id_val, article_title, c
         posts_api = service.posts()
         request = posts_api.insert(blogId=current_blog_id_val, body=post_body, isDraft=False)
         response = request.execute()
-        add_log(f"Successfully posted to Blogger: {article_title} (ID: {response.get('id')})")
+        add_log(f"Successfully posted to Blogger: {article_title} (ID: {response.get('id')}) URL: {response.get('url')}")
         return response
     except HttpError as e:
         error_content = e.resp.reason
         try:
             error_details = json.loads(e.content).get('error', {})
             error_message_detail = error_details.get('message', e.resp.reason)
-            error_status = error_details.get('status', 'UNKNOWN_STATUS')
-            add_log(f"Error posting to Blogger (HttpError {e.resp.status} - {error_status}): {error_message_detail}")
-        except: # Fallback if content is not JSON
+            error_code = error_details.get('code', e.resp.status) # Use code if available
+            add_log(f"Error posting to Blogger (HttpError {error_code}): {error_message_detail}")
+        except: 
              add_log(f"Error posting to Blogger (HttpError {e.resp.status}): {e.resp.reason}")
 
-        if e.resp.status == 401 or "invalid_grant" in str(e).lower() or "token has been expired or revoked" in str(e).lower():
-            add_log("Blogger API: Access token likely expired or revoked. Invalidating local token for re-authentication.")
-            st.session_state.credentials = None # This will prompt re-auth in UI
+        # Handle common auth errors that require re-authentication
+        # google.auth.exceptions.RefreshError might have already been caught if refresh was attempted
+        # This HttpError check is for when the access token is invalid during an API call.
+        if e.resp.status == 401 or e.resp.status == 403 or \
+           "invalid_grant" in str(e.content).lower() or \
+           "token has been expired" in str(e.content).lower() or \
+           "token has been revoked" in str(e.content).lower():
+            add_log("Blogger API: Access token error (e.g. expired/revoked). Invalidating local token for re-authentication.")
+            if 'credentials' in st.session_state: # Ensure modification is on the Streamlit session state
+                st.session_state.credentials = None 
             if os.path.exists(TOKEN_FILE):
-                try: os.remove(TOKEN_FILE)
+                try: os.remove(TOKEN_FILE); add_log("Removed token file due to API auth error.")
                 except Exception as ex_del: add_log(f"Could not delete token file: {ex_del}")
         return None
     except Exception as e:
         add_log(f"Generic error posting to Blogger: {e}")
+        tb_module.print_exc() # For more details on generic errors
         return None
 
 def check_blogger_token_validity(credentials_obj, current_blog_id_val):
-    if not credentials_obj:
-        add_log("Credentials not available for token validity check.")
+    if not credentials_obj or not credentials_obj.valid: # Added creds.valid check
+        add_log("Credentials not available or invalid for token validity check.")
         return False
     
     service = get_blogger_service_instance(credentials_obj)
@@ -621,11 +636,12 @@ def check_blogger_token_validity(credentials_obj, current_blog_id_val):
         return True
     except HttpError as e:
         add_log(f"Blogger token check failed (HttpError {e.resp.status}): {e.resp.reason}")
-        if e.resp.status == 401:
-             add_log("Token seems invalid or expired. Invalidating for re-auth.")
-             st.session_state.credentials = None # This will prompt re-auth in UI
+        if e.resp.status == 401 or e.resp.status == 403: # Unauthorized or Forbidden
+             add_log("Token seems invalid or expired during validity check. Invalidating for re-auth.")
+             if 'credentials' in st.session_state:
+                 st.session_state.credentials = None 
              if os.path.exists(TOKEN_FILE):
-                try: os.remove(TOKEN_FILE)
+                try: os.remove(TOKEN_FILE); add_log("Removed token file due to failed validity check.")
                 except Exception as ex_del: add_log(f"Could not delete token file: {ex_del}")
         return False
     except Exception as e:
@@ -636,30 +652,20 @@ def check_blogger_token_validity(credentials_obj, current_blog_id_val):
 def bot_worker_thread(stop_event, config):
     global _YOUTUBE_API_KEY_GLOBAL, _GEMINI_API_KEY_GLOBAL, _BLOG_ID_GLOBAL
 
-    # Set global API keys from config for helper functions
     _YOUTUBE_API_KEY_GLOBAL = config['youtube_api_key']
     _BLOG_ID_GLOBAL = config['blog_id']
     
-    # Configure Gemini API at the start of the thread
     if not configure_gemini_api_runtime(config['gemini_api_key']):
         add_log("Gemini API not configured. AI Enhancement will be skipped in bot thread.")
-        # Depending on strictness, could stop if Gemini is critical:
-        # add_log("Exiting bot thread as Gemini API is critical and not configured.")
-        # return
 
     add_log(f"Bot thread started. Target: >{config['min_post_word_count']} words. Interval: {config['post_interval_minutes']} min.")
     download_nltk_resources()
-
-    # Credentials should be passed and managed by the main Streamlit app state.
-    # The bot thread will use the credentials object it's given.
-    # If it becomes invalid, post_to_blogger_oauth or check_token_validity should handle it
-    # by setting st.session_state.credentials to None, which the UI will pick up.
 
     posted_urls = load_posted_urls()
     add_log(f"Loaded {len(posted_urls)} previously posted URLs from {POSTED_URLS_FILE}.")
 
     error_count = 0
-    max_errors_in_row = 7 # Max consecutive errors before pausing/stopping bot
+    max_errors_in_row = 7 
     search_queries = [
         "latest artificial intelligence breakthroughs", "new consumer electronics and gadgets", 
         "advances in machine learning research", "innovative software development trends",
@@ -672,16 +678,13 @@ def bot_worker_thread(stop_event, config):
 
     while not stop_event.is_set():
         try:
-            # --- Check Credentials before each major operation ---
-            # The credentials object is managed by st.session_state in the main thread.
-            # The bot thread reads this state at the start of each iteration.
-            # This is a simplification; for true shared state, a lock might be needed if written from here.
-            # However, if creds become invalid, functions like post_to_blogger will nullify them in st.session_state.
-            current_credentials_from_st = st.session_state.get('credentials')
+            # Get current credentials from Streamlit session state for this iteration
+            # This ensures the bot uses the latest credential status (e.g., after a UI re-auth)
+            current_credentials_from_st = st.session_state.get('credentials') 
             if not current_credentials_from_st or not current_credentials_from_st.valid:
                 add_log("Credentials invalid or missing at start of bot iteration. Pausing. Please re-authenticate via UI.")
-                if stop_event.wait(60): break # Wait and check stop event
-                continue # Skip this iteration, wait for user to re-auth
+                if stop_event.wait(60): break 
+                continue
 
             search_query = search_queries[current_query_index % len(search_queries)]
             current_query_index += 1
@@ -708,7 +711,7 @@ def bot_worker_thread(stop_event, config):
                 else:
                     add_log(f"DDG URL {ddg_url} already processed. Skipping direct.")
                 
-                if not primary_article_data: # Try building from source if direct fails or homepage-like
+                if not primary_article_data: 
                     parsed_uri = requests.utils.urlparse(ddg_url)
                     is_likely_homepage = not parsed_uri.path or parsed_uri.path == '/' or len(parsed_uri.path.split('/')) <= 2
                     if is_likely_homepage or (not primary_article_data and ddg_url not in posted_urls):
@@ -744,7 +747,7 @@ def bot_worker_thread(stop_event, config):
 
                     add_log(f"Primary article: '{primary_article_data['title']}' ({primary_article_data.get('word_count',0)} words)")
                     
-                    if _GEMINI_API_KEY_GLOBAL: # Check global config for Gemini
+                    if _GEMINI_API_KEY_GLOBAL: 
                         primary_article_data = enhance_article_with_ai(primary_article_data)
                     else:
                         add_log("Skipping AI enhancement (Gemini key not configured globally).")
@@ -765,13 +768,14 @@ def bot_worker_thread(stop_event, config):
                         
                         html_content = format_blog_post_content(list_of_articles, video)
                         
-                        # Use current credentials from Streamlit session state for posting
+                        # Crucially, use the up-to-date credentials from st.session_state for posting
+                        # This ensures that if re-authentication happened in the UI, the bot uses the new creds
                         if post_to_blogger_oauth(st.session_state.get('credentials'), _BLOG_ID_GLOBAL, post_title, html_content, list(keywords)):
                             for ad in list_of_articles:
                                 if ad['url'] not in posted_urls: save_posted_url(ad['url']); posted_urls.add(ad['url'])
                             posted_article_in_this_iteration = True
-                            error_count = 0 # Reset error count on success
-                            break # Successfully posted, move to next main loop iteration after wait
+                            error_count = 0 
+                            break 
                     else:
                         add_log(f"Combined content ({final_words} words) less than target. Skipping post.")
             
@@ -782,8 +786,8 @@ def bot_worker_thread(stop_event, config):
                 wait_duration = config['post_interval_minutes'] * 60
             else:
                 add_log("No new articles posted in this iteration.")
-                wait_duration = min(config['post_interval_minutes'] * 60, 15 * 60) # Shorter wait if no post, capped by interval
-
+                wait_duration = min(config['post_interval_minutes'] * 60 // 2, 15 * 60) # Shorter wait if no post
+            
             add_log(f"Waiting for {wait_duration // 60}m {wait_duration % 60}s...")
             if stop_event.wait(wait_duration): add_log("Wait interrupted."); break
         
@@ -800,13 +804,7 @@ def bot_worker_thread(stop_event, config):
             if stop_event.wait(300): break
 
     add_log("Bot thread finished.")
-    # Signal main thread that bot has stopped (if not by explicit stop button)
-    # This requires care; main thread should check thread.is_alive() or a flag.
-    # For now, relying on UI stop button and stop_event.
     if 'bot_running' in st.session_state and st.session_state.bot_running:
-        # This is tricky because st.session_state should ideally be modified by the main thread.
-        # A more robust solution might involve another queue or callback for the main thread to update UI state.
-        # For simplicity, we'll let the main thread's periodic refresh handle UI update if bot dies.
         add_log("Bot stopped unexpectedly or completed. UI may need refresh to update status.")
 
 
@@ -815,64 +813,87 @@ def streamlit_main():
     st.set_page_config(layout="wide")
     st.title("🤖 AI Tech News to Blogger Auto-Poster")
 
-    # --- Initialize Streamlit Session State ---
     if 'bot_running' not in st.session_state: st.session_state.bot_running = False
     if 'credentials' not in st.session_state: st.session_state.credentials = None
     if 'logs' not in st.session_state: st.session_state.logs = []
     if 'bot_thread' not in st.session_state: st.session_state.bot_thread = None
     
-    # --- Sidebar for Configuration and Control ---
     st.sidebar.header("⚙️ Configuration")
-    client_id = st.sidebar.text_input("Google Client ID", value="1082055366763-9a1e944hf42vfg6ca9dao52oij4sis43.apps.googleusercontent.com", help="Your Google OAuth Client ID")
-    client_secret = st.sidebar.text_input("Google Client Secret", value="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", type="password", help="Your Google OAuth Client Secret")
+    # Default values for client_id and client_secret as requested
+    client_id_default = "1082055366763-9a1e944hf42vfg6ca9dao52oij4sis43.apps.googleusercontent.com"
+    client_secret_default = "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"
+
+    client_id = st.sidebar.text_input("Google Client ID", value=st.session_state.get('client_id_input', client_id_default), help="Your Google OAuth Client ID")
+    client_secret = st.sidebar.text_input("Google Client Secret", value=st.session_state.get('client_secret_input', client_secret_default), type="password", help="Your Google OAuth Client Secret")
+    st.session_state.client_id_input = client_id # Store in session state if needed elsewhere, or just use variable
+    st.session_state.client_secret_input = client_secret
     
     st.session_state.blog_id_input = st.sidebar.text_input("Blogger Blog ID", value=st.session_state.get('blog_id_input', "1442443742033959520"), help="The ID of your Blogger blog")
     st.session_state.youtube_api_key_input = st.sidebar.text_input("YouTube API Key", value=st.session_state.get('youtube_api_key_input', "AIzaSyB7P7wzEaH46OqmC6gs9VY7sqMZzuLSBh4"), help="Needed for finding related videos")
     st.session_state.gemini_api_key_input = st.sidebar.text_input("Gemini API Key", value=st.session_state.get('gemini_api_key_input', "AIzaSyCrsJE4ZR_RxBvy2rlGjWalVkuUudKTm0c"), help="Needed for AI content enhancement")
     
-    post_interval_min = st.sidebar.number_input("Post Interval (minutes)", min_value=5, value=st.session_state.get('post_interval_min', 10), step=1, help="How often to attempt a new post")
+    post_interval_min = st.sidebar.number_input("Post Interval (minutes)", min_value=5, value=st.session_state.get('post_interval_min', 60), step=1, help="How often to attempt a new post")
     min_word_count = st.sidebar.number_input("Min Post Word Count", min_value=500, value=DEFAULT_MIN_POST_WORD_COUNT, step=100)
     max_articles_combine = st.sidebar.number_input("Max Articles to Combine", min_value=1, max_value=5, value=DEFAULT_MAX_ARTICLES_TO_COMBINE, step=1)
 
     st.sidebar.header("🔒 Authentication")
-    # Load credentials from file if they exist and are not in session state yet
     if not st.session_state.credentials and os.path.exists(TOKEN_FILE):
+        add_log(f"Token file {TOKEN_FILE} exists. Attempting to load credentials...")
         try:
-            st.session_state.credentials = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-            if st.session_state.credentials and st.session_state.credentials.expired and st.session_state.credentials.refresh_token:
-                st.session_state.credentials.refresh(Request()) # Refresh if expired
-                with open(TOKEN_FILE, 'w') as token_f: token_f.write(st.session_state.credentials.to_json())
-            if st.session_state.credentials and st.session_state.credentials.valid:
-                 add_log("Loaded and validated credentials from token.json.")
-            else: # Failed to load or validate
+            temp_creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+            add_log("Credentials loaded from file. Checking validity and attempting refresh if needed...")
+            if temp_creds.expired and temp_creds.refresh_token:
+                add_log("Token is expired. Attempting refresh...")
+                try:
+                    temp_creds.refresh(Request())
+                    with open(TOKEN_FILE, 'w') as token_f: token_f.write(temp_creds.to_json())
+                    add_log("Token refreshed successfully and saved.")
+                    st.session_state.credentials = temp_creds
+                except Exception as refresh_err:
+                    add_log(f"Token refresh failed: {refresh_err}. Removing token file.")
+                    st.session_state.credentials = None
+                    if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
+            elif not temp_creds.valid:
+                add_log("Token loaded from file is invalid and not refreshable. Removing token file.")
                 st.session_state.credentials = None
-                if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE) # Clean up bad token file
+                if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
+            else: # Valid and not expired, or valid after refresh
+                st.session_state.credentials = temp_creds
+                add_log("Credentials from token.json are valid.")
         except Exception as e:
-            add_log(f"Error auto-loading token: {e}. Please authenticate manually.")
+            add_log(f"Error loading/processing token from {TOKEN_FILE}: {e}. Removing token file.")
             st.session_state.credentials = None
-            if os.path.exists(TOKEN_FILE): os.remove(TOKEN_FILE)
+            if os.path.exists(TOKEN_FILE): 
+                try: os.remove(TOKEN_FILE)
+                except OSError as ose: add_log(f"Could not remove token file {TOKEN_FILE} after load error: {ose}")
 
 
     if st.session_state.credentials and st.session_state.credentials.valid:
         st.sidebar.success("Authenticated with Google ✔️")
-        # Check token validity for the specific blog ID (can be a bit slow, do it less often or on demand)
-        # if st.sidebar.button("Verify Token for Blog"):
-        #    check_blogger_token_validity(st.session_state.credentials, st.session_state.blog_id_input)
+        if st.sidebar.button("Verify Token / Check Blog Access"):
+            with st.spinner("Verifying token..."):
+                is_valid = check_blogger_token_validity(st.session_state.credentials, st.session_state.blog_id_input)
+            if is_valid:
+                st.sidebar.info("Token is valid and has access to the blog.")
+            else:
+                st.sidebar.error("Token verification failed. May need to re-authenticate.")
+                # check_blogger_token_validity might have already cleared credentials if it was a 401/403
+                st.rerun() # Rerun to reflect potential credential change
 
         if st.sidebar.button("Logout / Clear Credentials"):
             st.session_state.credentials = None
             if os.path.exists(TOKEN_FILE):
-                try: os.remove(TOKEN_FILE)
-                except Exception as e: add_log(f"Error removing token file: {e}")
-            add_log("Credentials cleared.")
+                try: os.remove(TOKEN_FILE); add_log("Token file removed on logout.")
+                except Exception as e: add_log(f"Error removing token file on logout: {e}")
+            add_log("Credentials cleared by user.")
             st.rerun()
     else:
-        st.sidebar.warning("Not Authenticated.")
-        if st.sidebar.button("Authenticate with Google"):
+        st.sidebar.warning("Not Authenticated with Google.")
+        if st.sidebar.button("🔑 Authenticate with Google"):
             if not client_id or not client_secret:
-                st.sidebar.error("Client ID and Client Secret must be provided.")
+                st.sidebar.error("Client ID and Client Secret must be provided in configuration.")
             else:
-                with st.spinner("Attempting Google Authentication... Check console/browser if needed."):
+                with st.spinner("Attempting Google Authentication... Check console/browser if needed for authorization."):
                     creds = get_credentials(client_id, client_secret)
                 if creds and creds.valid:
                     st.session_state.credentials = creds
@@ -880,10 +901,9 @@ def streamlit_main():
                     add_log("Google Authentication successful via UI button.")
                     st.rerun()
                 else:
-                    st.sidebar.error("Authentication Failed. Check logs.")
+                    st.sidebar.error("Authentication Failed. Check logs for details.")
                     add_log("Google Authentication failed via UI button.")
 
-    # --- Bot Control Area ---
     st.header("▶️ Bot Control")
     col1, col2 = st.columns(2)
 
@@ -893,11 +913,10 @@ def streamlit_main():
                 add_log("Stop button clicked. Signaling bot to stop...")
                 stop_event_global.set()
                 if st.session_state.bot_thread and st.session_state.bot_thread.is_alive():
-                    st.session_state.bot_thread.join(timeout=10) # Wait for thread to finish
+                    st.session_state.bot_thread.join(timeout=10) 
                     if st.session_state.bot_thread.is_alive():
                         add_log("Bot thread did not stop in time.")
-                    else:
-                        add_log("Bot thread stopped successfully.")
+                    else: add_log("Bot thread stopped successfully.")
                 st.session_state.bot_running = False
                 st.session_state.bot_thread = None
                 st.rerun()
@@ -907,10 +926,10 @@ def streamlit_main():
                     st.error("Please authenticate with Google first.")
                 elif not st.session_state.blog_id_input:
                     st.error("Blogger Blog ID is required.")
-                elif not st.session_state.youtube_api_key_input or st.session_state.youtube_api_key_input == "AIzaSyB7P7wzEaH46OqmC6gs9VY7sqMZzuLSBh4": # Placeholder
-                    st.error("Valid YouTube API Key is required.")
-                elif not st.session_state.gemini_api_key_input or st.session_state.gemini_api_key_input == "AIzaSyCrsJE4ZR_RxBvy2rlGjWalVkuUudKTm0c": # Placeholder
-                    st.error("Valid Gemini API Key is required.")
+                elif not st.session_state.youtube_api_key_input or st.session_state.youtube_api_key_input == "AIzaSyB7P7wzEaH46OqmC6gs9VY7sqMZzuLSBh4":
+                    st.error("Valid YouTube API Key is required (cannot be placeholder).")
+                elif not st.session_state.gemini_api_key_input or st.session_state.gemini_api_key_input == "AIzaSyCrsJE4ZR_RxBvy2rlGjWalVkuUudKTm0c":
+                    st.error("Valid Gemini API Key is required (cannot be placeholder).")
                 else:
                     add_log("Start button clicked. Starting bot thread...")
                     stop_event_global.clear()
@@ -923,6 +942,8 @@ def streamlit_main():
                         'post_interval_minutes': post_interval_min,
                         'min_post_word_count': min_word_count,
                         'max_articles_to_combine': max_articles_combine,
+                        # Pass client_id and client_secret IF bot thread needs to re-auth itself (more complex)
+                        # For now, bot relies on UI to re-auth and then picks up new st.session_state.credentials
                     }
                     
                     thread = threading.Thread(target=bot_worker_thread, args=(stop_event_global, bot_config), daemon=True)
@@ -935,33 +956,31 @@ def streamlit_main():
         status_text = "RUNNING" if st.session_state.bot_running else "STOPPED"
         st.markdown(f"**Bot Status:** <span style='color:{status_color};'>{status_text}</span>", unsafe_allow_html=True)
         if st.session_state.bot_thread and not st.session_state.bot_thread.is_alive() and st.session_state.bot_running:
-             # Bot was running but thread died
              st.error("Bot thread seems to have stopped unexpectedly! Check logs.")
-             st.session_state.bot_running = False # Correct the state
+             add_log("Detected that bot thread is no longer alive while UI state is 'bot_running'. Correcting UI state.")
+             st.session_state.bot_running = False 
+             st.rerun()
 
 
-    # --- Log Display Area ---
     st.header("📜 Bot Activity Logs")
     log_placeholder = st.empty()
     
-    # Process log queue
-    new_logs = []
+    new_logs_from_queue = []
     while not log_queue_global.empty():
         try:
-            new_logs.append(log_queue_global.get_nowait())
+            new_logs_from_queue.append(log_queue_global.get_nowait())
         except queue.Empty:
             break
     
-    if new_logs:
-        st.session_state.logs = new_logs + st.session_state.logs # Prepend new logs
-        if len(st.session_state.logs) > 200: # Limit log history
-            st.session_state.logs = st.session_state.logs[:200]
+    if new_logs_from_queue:
+        st.session_state.logs = new_logs_from_queue + st.session_state.logs 
+        if len(st.session_state.logs) > 300: # Limit log history
+            st.session_state.logs = st.session_state.logs[:300]
 
-    log_placeholder.text_area("", value="\n".join(st.session_state.logs), height=400, key="log_display_area_unique")
+    log_placeholder.text_area("Logs", value="\n".join(st.session_state.logs), height=400, key="log_display_area_unique_key")
 
-    # Auto-refresh logs if bot is running
     if st.session_state.bot_running:
-        time.sleep(2) # Refresh interval for logs (seconds)
+        time.sleep(2) 
         st.rerun()
 
 if __name__ == "__main__":
